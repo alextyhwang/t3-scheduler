@@ -1,0 +1,21 @@
+.state/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Local schedules and private automation content
+/jobs.toml
+/jobs.*.toml
+!/jobs.example.toml
+/automations/
+/prompts/*
+!/prompts/example-nightly-review.md
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.secret
+*.token

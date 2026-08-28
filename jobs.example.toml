@@ -1,0 +1,25 @@
+[scheduler]
+state_dir = ".state"
+misfire_grace_minutes = 15
+
+[t3]
+base_url = "http://127.0.0.1:3773"
+base_dir = "%LOCALAPPDATA%\\t3-code"
+auto_start = true
+startup_timeout_seconds = 30
+
+[[jobs]]
+id = "example-nightly-review"
+enabled = false
+cron = "0 20 * * *"
+timezone = "America/Los_Angeles"
+project = "C:\\Users\\you\\Projects\\your-project"
+title = "Nightly review"
+prompt_file = "prompts/example-nightly-review.md"
+instance_id = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+service_tier = "default"
+runtime_mode = "full-access"
+interaction_mode = "default"
+misfire_policy = "run-once"

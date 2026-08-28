@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t3-scheduler"
+version = "0.1.0"
+description = "Cron-style scheduling for native T3 Code threads on Windows"
+requires-python = ">=3.11"
+dependencies = ["tzdata>=2025.2"]
+
+[project.scripts]
+t3-scheduler = "t3_scheduler.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

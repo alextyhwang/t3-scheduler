@@ -66,14 +66,16 @@ effects before continuing.
    thread completed successfully and the same thread continued across multiple
    authorized Codex instances. The HTTP bootstrap compatibility workaround is
    covered by deterministic retry tests.
-4. **Active Blackbox rollout — deployed:** `allow_interactive_threads` is
+4. **Active Blackbox rollout — validated:** `allow_interactive_threads` is
    enabled and the authorized fallback instances share one priority tier, so
-   remaining quota decides the target. The first natural terminal quota event
-   remains the end-to-end trigger acceptance test because no configured account
-   was exhausted during deployment.
-5. **Hardening follow-up:** retain manual-review alerts and verify the first
-   natural failover incident before treating the current T3 Nightly contract as
-   stable.
+   remaining quota decides the target. On 2026-09-10, a natural terminal quota
+   event switched the same live thread from Alvin to Oliver and the Oliver turn
+   completed.
+5. **Hardening follow-up:** the first natural event exposed that T3 Nightly
+   projects persisted user messages with `turnId: null`. The verifier now
+   correlates the exact persisted message ID while rejecting a conflicting turn
+   ID or a later user message. Keep manual-review alerts enabled and retain this
+   live projection shape in regression tests.
 6. **Lower-latency follow-up:** replace one-minute polling with the verified T3
    configuration/thread event streams only if the stable polling release is
    reliable across Nightly upgrades.
@@ -93,6 +95,20 @@ effects before continuing.
   databases.
 - Logs and journals contain no bearer tokens, credentials, account email
   addresses, or raw provider payloads.
+
+## First natural quota incident
+
+The 2026-09-10 Blackbox acceptance event detected an exhausted Alvin turn and
+selected Oliver from fresh provider usage. A manually submitted `continue`
+raced the one-minute scan and produced a second Alvin quota error before the
+coordinator message was dispatched. The coordinator's following turn ran and
+completed on Oliver.
+
+The switch initially appeared as `manual-review / unexpected_thread_change` in
+the scheduler journal because live T3 left the coordinator's persisted user
+message unbound (`turnId: null`) while the fixture expected the new turn ID.
+After adding the live-shape regression, the verifier was fixed and the incident
+was reconciled to `recovered`. No T3 thread database was edited.
 
 ## Rollback
 

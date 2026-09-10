@@ -197,12 +197,15 @@ def _unresolved_activity_reason(detail: dict[str, Any], turn_id: str) -> str | N
 
 
 def _has_message(detail: dict[str, Any], message_id: str, turn_id: object) -> bool:
-    return any(
-        isinstance(message, dict)
-        and message_id in {message.get("id"), message.get("messageId")}
-        and message.get("turnId") == turn_id
-        for message in detail.get("messages", [])
-    )
+    messages = [message for message in detail.get("messages", []) if isinstance(message, dict)]
+    for index, message in enumerate(messages):
+        if message_id not in {message.get("id"), message.get("messageId")}:
+            continue
+        if message.get("turnId") == turn_id:
+            return True
+        if message.get("turnId") is None:
+            return not any(item.get("role") == "user" for item in messages[index + 1 :])
+    return False
 
 
 def _pending_shell_reason(thread: dict[str, Any]) -> str | None:

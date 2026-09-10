@@ -152,6 +152,12 @@ The coordinator reacts only to T3's normalized terminal usage-limit failure, not
 
 Before continuing, it re-reads the thread. If the user has retried, switched providers, or otherwise changed the latest turn, automatic recovery stops. A failed turn with unresolved tool calls, pending approval or user input, or an external write whose outcome cannot be established is placed in manual review rather than replayed. This prevents quota recovery from duplicating side effects.
 
+T3 Nightly may project a persisted user message with no `turnId`. Verification
+therefore correlates the coordinator's exact durable message ID and requires it
+to remain the latest user message, while still requiring the selected provider
+and expected terminal/running state. A conflicting non-null turn ID or a later
+user message remains a manual-review condition.
+
 The current T3 continuation command does not expose an atomic expected-turn
 precondition. The coordinator performs detail and shell preflight reads as close
 as possible to dispatch, but a small read-to-dispatch race remains. Keep active

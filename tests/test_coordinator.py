@@ -308,6 +308,176 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(result.actions[0].target_instance_id, "last")
             self.assertEqual(client.dispatched[-1]["modelSelection"]["instanceId"], "last")
 
+    def test_running_fallback_that_hits_quota_advances_same_incident_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient(failed_thread())
+            coordinator = FailoverCoordinator(self._config(root), client)
+
+            first = coordinator.scan()
+            first_message_id = client.dispatched[0]["message"]["messageId"]
+            client.thread = {
+                **failed_thread("backup", "turn-2"),
+                "latestTurn": {"turnId": "turn-2", "state": "running"},
+                "session": {
+                    "status": "running",
+                    "providerName": "codex",
+                    "providerInstanceId": "backup",
+                    "activeTurnId": "turn-2",
+                    "lastError": None,
+                },
+                "messages": [{"id": first_message_id, "turnId": "turn-2"}],
+            }
+
+            running = coordinator.scan()
+            client.thread["latestTurn"]["state"] = "error"
+            client.thread["session"].update(
+                {
+                    "status": "error",
+                    "activeTurnId": None,
+                    "lastError": "Codex usage limit reached. Weekly limit resets later.",
+                }
+            )
+            second_failure = coordinator.scan()
+
+            self.assertEqual(first.actions[0].outcome, "verifying")
+            self.assertEqual(running.actions[0].outcome, "verifying")
+            self.assertEqual(second_failure.actions[0].outcome, "verifying")
+            self.assertEqual(
+                second_failure.actions[0].incident_id,
+                first.actions[0].incident_id,
+            )
+            self.assertEqual(second_failure.actions[0].target_instance_id, "last")
+            self.assertEqual(
+                [command["modelSelection"]["instanceId"] for command in client.dispatched],
+                ["backup", "last"],
+            )
+            with RunJournal(root / ".state" / "runs.sqlite3") as journal:
+                incident = journal.active_incident_for_thread("thread-1")
+                self.assertIsNotNone(incident)
+                attempts = journal.provider_attempts(incident.id)
+                self.assertEqual(
+                    [attempt.provider_instance_id for attempt in attempts],
+                    ["backup", "last"],
+                )
+                self.assertEqual(attempts[0].state, "failed")
+                self.assertEqual(attempts[0].error_code, "quota_exhausted")
+                self.assertEqual(attempts[1].state, "verifying")
+
+    def test_reconcile_accepts_target_turn_when_coordinator_message_is_unbound(self):
+        for turn_state, session_status, expected_outcome in (
+            ("running", "running", "verifying"),
+            ("completed", "idle", "recovered"),
+        ):
+            with self.subTest(turn_state=turn_state):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    client = FakeClient(failed_thread())
+                    coordinator = FailoverCoordinator(self._config(root), client)
+                    first = coordinator.scan()
+                    coordinator_message_id = client.dispatched[0]["message"]["messageId"]
+                    client.thread = {
+                        **failed_thread("backup", "turn-2"),
+                        "latestTurn": {"turnId": "turn-2", "state": turn_state},
+                        "session": {
+                            "status": session_status,
+                            "providerName": "codex",
+                            "providerInstanceId": "backup",
+                            "activeTurnId": "turn-2" if turn_state == "running" else None,
+                            "lastError": None,
+                        },
+                        "messages": [
+                            {
+                                "id": "manual-message",
+                                "role": "user",
+                                "turnId": "turn-1",
+                            },
+                            {
+                                "id": coordinator_message_id,
+                                "role": "user",
+                                "turnId": None,
+                            },
+                        ],
+                    }
+
+                    result = coordinator.scan()
+
+                    self.assertEqual(first.actions[0].outcome, "verifying")
+                    self.assertEqual(result.actions[0].outcome, expected_outcome)
+                    self.assertEqual(len(client.dispatched), 1)
+                    with RunJournal(root / ".state" / "runs.sqlite3") as journal:
+                        incident = journal.connection.execute(
+                            "SELECT state FROM failover_incidents"
+                        ).fetchone()
+                        self.assertEqual(incident[0], expected_outcome)
+
+    def test_reconcile_rejects_coordinator_message_bound_to_another_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient(failed_thread())
+            coordinator = FailoverCoordinator(self._config(root), client)
+            coordinator.scan()
+            coordinator_message_id = client.dispatched[0]["message"]["messageId"]
+            client.thread = {
+                **failed_thread("backup", "turn-2"),
+                "latestTurn": {"turnId": "turn-2", "state": "running"},
+                "session": {
+                    "status": "running",
+                    "providerName": "codex",
+                    "providerInstanceId": "backup",
+                    "activeTurnId": "turn-2",
+                    "lastError": None,
+                },
+                "messages": [
+                    {
+                        "id": coordinator_message_id,
+                        "role": "user",
+                        "turnId": "different-turn",
+                    }
+                ],
+            }
+
+            result = coordinator.scan()
+
+            self.assertEqual(result.actions[0].outcome, "manual-review")
+            self.assertEqual(result.actions[0].reason, "unexpected_thread_change")
+
+    def test_reconcile_rejects_unbound_coordinator_message_before_new_user_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient(failed_thread())
+            coordinator = FailoverCoordinator(self._config(root), client)
+            coordinator.scan()
+            coordinator_message_id = client.dispatched[0]["message"]["messageId"]
+            client.thread = {
+                **failed_thread("backup", "turn-2"),
+                "latestTurn": {"turnId": "turn-2", "state": "running"},
+                "session": {
+                    "status": "running",
+                    "providerName": "codex",
+                    "providerInstanceId": "backup",
+                    "activeTurnId": "turn-2",
+                    "lastError": None,
+                },
+                "messages": [
+                    {
+                        "id": coordinator_message_id,
+                        "role": "user",
+                        "turnId": None,
+                    },
+                    {
+                        "id": "later-user-message",
+                        "role": "user",
+                        "turnId": None,
+                    },
+                ],
+            }
+
+            result = coordinator.scan()
+
+            self.assertEqual(result.actions[0].outcome, "manual-review")
+            self.assertEqual(result.actions[0].reason, "unexpected_thread_change")
+
     def test_chained_uncertain_dispatch_retries_identical_second_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -4,9 +4,43 @@ misfire_grace_minutes = 15
 
 [t3]
 base_url = "http://127.0.0.1:3773"
-base_dir = "%LOCALAPPDATA%\\t3-code"
+base_dir = "%USERPROFILE%\\.t3"
 auto_start = true
 startup_timeout_seconds = 30
+
+[failover]
+# Shadow mode reports the provider that would be selected without switching it.
+enabled = false
+mode = "shadow"
+# Interactive threads are opt-in; scheduled threads can be handled separately.
+allow_interactive_threads = false
+# Empty means every project in the selected thread scope. Paths may be relative
+# to this file or absolute.
+project_allowlist = []
+max_usage_age_seconds = 300
+allow_unknown_usage = false
+
+# Higher priority tiers win first. Within a tier, the account with the most
+# headroom in its most-constrained active usage window wins. File order breaks ties.
+[[failover.providers]]
+instance_id = "codex_account_2"
+priority = 100
+enabled = true
+
+[[failover.providers]]
+instance_id = "codex_account_3"
+priority = 100
+enabled = true
+
+[[failover.providers]]
+instance_id = "codex_jimmy"
+priority = 50
+enabled = true
+
+[[failover.providers]]
+instance_id = "codex_oliver"
+priority = 50
+enabled = true
 
 [[jobs]]
 id = "example-nightly-review"

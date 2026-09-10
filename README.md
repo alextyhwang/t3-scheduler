@@ -16,6 +16,8 @@ T3 Scheduler runs Codex jobs on a schedule and opens each one as a real thread i
 
 Windows Task Scheduler provides the clock. When a job is due, this project starts T3's bundled server in headless mode if needed, authenticates with limited permissions, and dispatches the prompt through T3's native orchestration API.
 
+The project also contains an opt-in provider failover coordinator. It can detect a terminal usage-limit failure, rank compatible provider instances, and continue the same native T3 thread. Failover is disabled by default and is intended to move through disabled, shadow, and active rollout stages.
+
 ## Why this exists
 
 T3 is a great place to supervise agent work, but it does not currently expose a cron-style CLI. Running `codex exec` on a timer works, but those runs do not become native T3 threads. T3 Scheduler bridges that gap.
@@ -25,6 +27,7 @@ T3 is a great place to supervise agent work, but it does not currently expose a 
 - Automatic catch-up for briefly missed schedules
 - DPAPI-protected T3 credentials with automatic renewal
 - SQLite run journal and stable command IDs to avoid duplicate dispatches
+- Durable failover incidents with at-most-once provider attempts
 - No custom always-running scheduler daemon
 
 ## Quick start
@@ -50,13 +53,17 @@ Send it immediately when the preview looks right:
 run.cmd run example-nightly-review
 ```
 
-Finally, install the one-minute scheduler from an elevated terminal:
+Finally, install the one-minute scheduler:
 
 ```powershell
 install-task.cmd
 ```
 
 The desktop app can now stay closed. A lightweight headless T3 server is started only when a due job needs it.
+
+An elevated install uses an S4U task with highest privileges and can run while
+the user is signed out. A non-elevated install creates a limited current-user
+task that runs while that user is signed in.
 
 ## Define a job
 
@@ -84,6 +91,77 @@ Use either `prompt` for a short inline prompt or `prompt_file` for a longer one.
 
 `run-once` catches the most recent missed occurrence within `scheduler.misfire_grace_minutes`. Use `skip` when a late run would be worse than no run.
 
+## Configure provider failover
+
+Failover uses T3's configured provider instances; it does not copy or merge account credentials. Every candidate must be enabled, installed, authenticated, available, use the same provider driver and continuation group as the current thread, and support the thread's model.
+
+Start in shadow mode:
+
+```toml
+[failover]
+enabled = true
+mode = "shadow"
+max_usage_age_seconds = 300
+allow_unknown_usage = false
+
+# Interactive chats are excluded until this is deliberately enabled.
+allow_interactive_threads = false
+
+# Empty means every project within the selected scheduled/interactive scope.
+# Relative paths are resolved from jobs.toml.
+project_allowlist = [
+  "C:\\Users\\you\\Projects\\important-project",
+]
+
+[[failover.providers]]
+instance_id = "codex_account_2"
+priority = 100
+enabled = true
+
+[[failover.providers]]
+instance_id = "codex_account_3"
+priority = 100
+enabled = true
+
+[[failover.providers]]
+instance_id = "codex_jimmy"
+priority = 50
+enabled = true
+
+[[failover.providers]]
+instance_id = "codex_oliver"
+priority = 50
+enabled = true
+```
+
+`enabled` is the master switch. The rollout modes are:
+
+- **Disabled:** set `enabled = false`; the coordinator does no failover work.
+- **Shadow:** detects incidents and calculates what it would do, without sending a continuation turn.
+- **Active:** may send a continuation turn after all safety and compatibility checks pass.
+
+Higher priority values form preferred tiers. Within the highest eligible tier, the coordinator chooses the account with the most effective headroom. Effective headroom is the smallest remaining percentage across its active usage windows, so an exhausted weekly allowance cannot be hidden by a healthy short window. Configuration order breaks exact ties.
+
+Usage older than `max_usage_age_seconds` is unknown. With `allow_unknown_usage = false`, unknown accounts are excluded. When enabled, unknown accounts rank below accounts with known positive headroom in the same priority tier. An account with a known exhausted active window is never selected.
+
+Scheduled threads are the initial rollout scope. Set `allow_interactive_threads = true` only when failover should also watch chats started manually in T3 Code. Use `project_allowlist` to constrain either scope to known workspace roots before broadening it; an empty list means no project restriction.
+
+### Coordinator safety
+
+The coordinator reacts only to T3's normalized terminal usage-limit failure, not ordinary agent errors, policy refusals, authentication problems, network failures, cancellations, or interruptions. It attempts each eligible provider at most once per incident and preserves the original thread, model, runtime mode, and interaction mode.
+
+Before continuing, it re-reads the thread. If the user has retried, switched providers, or otherwise changed the latest turn, automatic recovery stops. A failed turn with unresolved tool calls, pending approval or user input, or an external write whose outcome cannot be established is placed in manual review rather than replayed. This prevents quota recovery from duplicating side effects.
+
+The current T3 continuation command does not expose an atomic expected-turn
+precondition. The coordinator performs detail and shell preflight reads as close
+as possible to dispatch, but a small read-to-dispatch race remains. Keep active
+mode restricted to a project allowlist during the pilot; shadow is the default.
+
+The scheduler's one-minute Windows task provides the coordinator clock: each invocation scans, handles claimable incidents, and exits. Recovery therefore is not instantaneous and can take about one scan interval. If the task is not installed or running, no automatic scan occurs; this repository does not install or activate failover merely because it is configured.
+
+See [the native provider failover plan](docs/provider-failover-plan.md) for the
+state machine, safety boundary, rollout stages, release gates, and rollback.
+
 ## Keep your automations private
 
 The public repository contains only `jobs.example.toml` and a harmless example prompt. Your actual schedules and automation content stay local:
@@ -107,25 +185,45 @@ All of these paths are covered by `.gitignore`. Put personal prompts under `prom
 | `run.cmd tick` | Dispatch every job due now |
 | `run.cmd run JOB_ID --dry-run` | Preview one job immediately |
 | `run.cmd run JOB_ID` | Dispatch one job immediately |
+| `run.cmd failover --dry-run` | Preview one failover scan without recording an incident or dispatching a continuation |
+| `run.cmd failover` | Run one shadow or active failover scan, according to configuration |
+| `run.cmd failover-status` | Show durable failover incident and provider-attempt status |
 | `test.cmd` | Run the unit test suite |
 
 ## How it works
 
 ```text
-Windows Task Scheduler
-        |
-        v
-  due-job runner ----> SQLite run journal
-        |
-        v
-headless T3 server ----> native T3 thread ----> Codex
+                    Windows Task Scheduler
+                              |
+                    one-minute tick, then exit
+                         /             \
+                        v               v
+               due-job runner     failover scanner
+                     |                  |
+                     v                  v
+              SQLite run journal  incident/attempt journal
+                         \             /
+                          v           v
+                   headless T3 server
+                           |
+                           v
+                native T3 thread ----> Codex
 ```
 
-The Windows task wakes once per minute and exits immediately when nothing is due. Successful `(job, scheduled minute)` pairs are not sent twice. If a request has an uncertain result, retries reuse the original T3 command and thread IDs.
+The Windows task wakes once per minute and exits immediately when there is no work. Successful `(job, scheduled minute)` pairs are not sent twice. If a request has an uncertain result, retries reuse the original T3 command and thread IDs. Failover uses separate durable incident and provider-attempt records so scheduled dispatch idempotency and continuation idempotency cannot interfere with each other.
 
 ## Status and compatibility
 
-T3 Scheduler is Windows-first and currently targets T3 Code's local orchestration API. That API is not yet a documented public compatibility surface, so a future T3 release may require an update here. Run `run.cmd doctor` after upgrading T3.
+T3 Scheduler is Windows-first and currently targets T3 Code's local orchestration and provider-status interfaces. These are not yet documented public compatibility surfaces, so a future T3 release may require an update here. Failover must stop safely when required fields or continuation capabilities are absent. Run `run.cmd doctor` after upgrading T3 and verify that `t3.base_dir` points at the active T3 control root; the example uses `%USERPROFILE%\.t3`.
+
+Current T3 HTTP builds validate `bootstrap.createThread` but do not execute that
+bootstrap stage. For scheduler-created threads, the client therefore sends a
+deterministic `thread.create` command followed by the persisted
+`thread.turn.start` command. Both command IDs remain stable across uncertain
+retries. Worktree/setup-script bootstrap is rejected because reproducing those
+WebSocket-only stages without their lifecycle fences would be unsafe.
+
+Only configure accounts and provider instances you are authorized to use. Automatic failover is not intended to evade provider restrictions, bypass protective measures, or retry a policy refusal. Review the terms for every configured provider, including [OpenAI's Terms of Use](https://openai.com/policies/terms-of-use/), before enabling active mode.
 
 This is an independent community project and is not affiliated with or endorsed by T3 Code.
 

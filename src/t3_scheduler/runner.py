@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig, JobConfig
+from .coordinator import CoordinatorScanResult, FailoverCoordinator
 from .state import RunJournal
 from .t3 import T3Client, T3Error
 
@@ -154,6 +155,45 @@ class SchedulerRunner:
         _, command = build_command(job, project, scheduled_for)
         return command
 
+    @staticmethod
+    def _print_failover_result(result: CoordinatorScanResult) -> None:
+        if not result.enabled:
+            print("Failover is disabled.")
+            return
+        if not result.actions:
+            print(f"Failover {result.mode}: no actionable quota failures.")
+            return
+        for action in result.actions:
+            target = f" -> {action.target_instance_id}" if action.target_instance_id else ""
+            reason = f" ({action.reason})" if action.reason else ""
+            print(f"FAILOVER {action.outcome}: thread {action.thread_id}{target}{reason}")
+
+    def scan_failover(self, *, dry_run: bool = False) -> CoordinatorScanResult:
+        result = FailoverCoordinator(self.config, self.client).scan(dry_run=dry_run)
+        self._print_failover_result(result)
+        return result
+
+    def failover_status(self, *, limit: int = 50) -> int:
+        with RunJournal(self.config.state_dir / "runs.sqlite3") as journal:
+            records = [
+                (incident, journal.provider_attempts(incident.id))
+                for incident in journal.list_failover_incidents(limit=limit)
+            ]
+        if not records:
+            print("No failover incidents recorded.")
+            return 0
+        for incident, attempts in records:
+            source = incident.failed_instance_id or "unknown"
+            attempt_text = ", ".join(
+                f"{attempt.provider_instance_id}:{attempt.state}" for attempt in attempts
+            ) or "none"
+            print(
+                f"{incident.state}: thread {incident.thread_id}; "
+                f"source {source}; failure {incident.failure_code}; "
+                f"attempts {attempt_text}; detected {incident.detected_at}"
+            )
+        return 0
+
     def dispatch_one(
         self,
         job: JobConfig,
@@ -190,6 +230,19 @@ class SchedulerRunner:
 
     def tick(self, *, now: datetime | None = None, dry_run: bool = False) -> int:
         now = now or datetime.now(timezone.utc)
+        failover_failed = False
+        if self.config.failover.enabled:
+            try:
+                failover_result = self.scan_failover(dry_run=dry_run)
+                failover_failed = any(
+                    action.outcome in {"manual-review", "exhausted"}
+                    for action in failover_result.actions
+                )
+            except Exception as exc:
+                # Keep scheduled dispatch independent from coordinator compatibility
+                # or transport failures. The task still returns nonzero for visibility.
+                failover_failed = True
+                print(f"ERROR failover: {exc}")
         due = [
             (job, occurrence)
             for job in self.config.jobs
@@ -199,7 +252,7 @@ class SchedulerRunner:
         ]
         if not due:
             print("No jobs due.")
-            return 0
+            return 1 if failover_failed else 0
         failures = 0
         with RunJournal(self.config.state_dir / "runs.sqlite3") as journal:
             for job, occurrence in due:
@@ -208,10 +261,11 @@ class SchedulerRunner:
                 except Exception as exc:
                     failures += 1
                     print(f"ERROR {job.id}: {exc}")
-        return 1 if failures else 0
+        return 1 if failures or failover_failed else 0
 
     def run_manual(self, job_id: str, *, dry_run: bool = False) -> int:
         job = self._job(job_id)
         now = datetime.now(job.timezone).replace(microsecond=0)
-        self.dispatch_one(job, now, dry_run=dry_run)
+        with RunJournal(self.config.state_dir / "runs.sqlite3") as journal:
+            self.dispatch_one(job, now, dry_run=dry_run, journal=journal)
         return 0

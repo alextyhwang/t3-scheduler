@@ -2,9 +2,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from t3_scheduler.config import load_config
-from t3_scheduler.runner import build_command, scheduled_occurrence
+from t3_scheduler.coordinator import CoordinatorAction, CoordinatorScanResult
+from t3_scheduler.runner import SchedulerRunner, build_command, scheduled_occurrence
+from t3_scheduler.state import RunJournal
 
 
 class RunnerTests(unittest.TestCase):
@@ -26,6 +29,17 @@ reasoning_effort = "high"
         )
         return load_config(config).jobs[0]
 
+    def _failover_config(self, directory: str):
+        config = Path(directory) / "jobs.toml"
+        config.write_text(
+            '''[failover]
+enabled = true
+mode = "shadow"
+''',
+            encoding="utf-8",
+        )
+        return load_config(config)
+
     def test_misfire_returns_latest_occurrence(self):
         with tempfile.TemporaryDirectory() as directory:
             job = self._job(directory)
@@ -45,6 +59,58 @@ reasoning_effort = "high"
             self.assertEqual(command["bootstrap"]["createThread"]["projectId"], "project-1")
             self.assertEqual(command["modelSelection"]["model"], "gpt-test")
             self.assertIn("nightly", command["message"]["text"])
+
+    def test_tick_runs_failover_scan_even_when_no_jobs_are_due(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._failover_config(directory)
+            result = CoordinatorScanResult(True, "shadow", 0, ())
+            with patch("t3_scheduler.runner.FailoverCoordinator") as coordinator:
+                coordinator.return_value.scan.return_value = result
+                runner = SchedulerRunner(config, client=object())
+                self.assertEqual(runner.tick(), 0)
+                coordinator.return_value.scan.assert_called_once_with(dry_run=False)
+
+    def test_tick_isolates_failover_transport_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._failover_config(directory)
+            with patch("t3_scheduler.runner.FailoverCoordinator") as coordinator:
+                coordinator.return_value.scan.side_effect = RuntimeError("incompatible T3")
+                runner = SchedulerRunner(config, client=object())
+                self.assertEqual(runner.tick(), 1)
+
+    def test_tick_returns_nonzero_for_manual_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._failover_config(directory)
+            result = CoordinatorScanResult(
+                True,
+                "active",
+                1,
+                (CoordinatorAction("thread-1", "manual-review", 1),),
+            )
+            with patch("t3_scheduler.runner.FailoverCoordinator") as coordinator:
+                coordinator.return_value.scan.return_value = result
+                runner = SchedulerRunner(config, client=object())
+                self.assertEqual(runner.tick(), 1)
+
+    def test_manual_run_is_journaled_for_scheduler_only_failover_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "jobs.toml"
+            job = self._job(directory)
+            config = load_config(config_path)
+            client = Mock()
+            client.shell_snapshot.return_value = {
+                "projects": [
+                    {"id": "project-1", "workspaceRoot": str(job.project)}
+                ]
+            }
+            client.dispatch.return_value = {"sequence": 1}
+            runner = SchedulerRunner(config, client=client)
+
+            self.assertEqual(runner.run_manual("nightly"), 0)
+
+            thread_id = client.dispatch.call_args.args[0]["threadId"]
+            with RunJournal(config.state_dir / "runs.sqlite3") as journal:
+                self.assertIn(thread_id, journal.scheduler_thread_ids())
 
 
 if __name__ == "__main__":

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import ConfigError, load_config
 from .runner import RunnerError, SchedulerRunner
-from .t3 import T3Client, T3Error
+from .t3 import T3Error
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -22,6 +29,14 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser("list", help="list configured jobs")
     subcommands.add_parser("doctor", help="validate configuration and T3 connectivity")
     subcommands.add_parser("auth", help="create or renew the scheduler's T3 credential")
+    failover = subcommands.add_parser(
+        "failover", help="scan once for quota failures and coordinate recovery"
+    )
+    failover.add_argument("--dry-run", action="store_true")
+    failover_status = subcommands.add_parser(
+        "failover-status", help="show recent failover incidents"
+    )
+    failover_status.add_argument("--limit", type=_positive_int, default=50)
     return parser
 
 
@@ -41,7 +56,17 @@ def main(arguments: list[str] | None = None) -> int:
             return runner.tick(dry_run=args.dry_run)
         if args.command == "run":
             return runner.run_manual(args.job_id, dry_run=args.dry_run)
-        client = T3Client(config.t3, config.state_dir)
+        if args.command == "failover":
+            result = runner.scan_failover(dry_run=args.dry_run)
+            return int(
+                any(
+                    action.outcome in {"manual-review", "exhausted"}
+                    for action in result.actions
+                )
+            )
+        if args.command == "failover-status":
+            return runner.failover_status(limit=args.limit)
+        client = runner.client
         if args.command == "auth":
             client.ensure_server()
             client.token(force_renew=True)
@@ -53,17 +78,48 @@ def main(arguments: list[str] | None = None) -> int:
                     raise RunnerError(f"job {job.id!r} project does not exist: {job.project}")
                 if job.prompt_file and not job.prompt_file.is_file():
                     raise RunnerError(f"job {job.id!r} prompt file does not exist: {job.prompt_file}")
+            identity = client.check_base_dir_identity()
+            if identity.compatible is False:
+                raise T3Error(
+                    "saved scheduler credential does not belong to configured "
+                    f"t3.base_dir {identity.configured_base_dir} ({identity.reason})"
+                )
             client.ensure_server()
             token = client.token()
             snapshot = client.shell_snapshot()
             roots = {str(project.get("workspaceRoot")) for project in snapshot.get("projects", [])}
+            provider_count = None
+            if config.failover.enabled:
+                providers = client.provider_snapshots(refresh=False)
+                provider_ids = {
+                    str(provider.get("instanceId"))
+                    for provider in providers
+                    if isinstance(provider, dict) and provider.get("instanceId")
+                }
+                configured_ids = {
+                    provider.instance_id
+                    for provider in config.failover.providers
+                    if provider.enabled
+                }
+                missing = sorted(configured_ids - provider_ids)
+                if missing:
+                    raise RunnerError(
+                        "failover provider instance(s) not found in T3: " + ", ".join(missing)
+                    )
+                provider_count = len(provider_ids)
             print(f"Configuration OK: {len(config.jobs)} job(s)")
             print(f"T3 server OK: {config.t3.base_url}")
             print(f"T3 auth OK: {len(token)}-character protected credential")
             print(f"T3 projects visible: {len(roots)}")
+            if provider_count is not None:
+                print(
+                    f"Failover {config.failover.mode}: "
+                    f"{len(config.failover.providers)} configured; "
+                    f"{provider_count} T3 provider instance(s) visible"
+                )
             return 0
         raise AssertionError(args.command)
-    except (ConfigError, RunnerError, T3Error, OSError) as exc:
+    except (ConfigError, RunnerError, T3Error, OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

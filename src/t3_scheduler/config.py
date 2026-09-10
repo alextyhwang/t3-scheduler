@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -20,6 +20,24 @@ class T3Config:
     auto_start: bool
     startup_timeout_seconds: int
     executable: Path | None = None
+
+
+@dataclass(frozen=True)
+class FailoverProviderConfig:
+    instance_id: str
+    priority: int
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class FailoverConfig:
+    enabled: bool = False
+    mode: str = "shadow"
+    max_usage_age_seconds: int = 300
+    allow_unknown_usage: bool = False
+    providers: tuple[FailoverProviderConfig, ...] = ()
+    allow_interactive_threads: bool = False
+    project_allowlist: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,11 +67,82 @@ class AppConfig:
     misfire_grace_minutes: int
     t3: T3Config
     jobs: tuple[JobConfig, ...]
+    failover: FailoverConfig = field(default_factory=FailoverConfig)
 
 
 def _path(value: str, *, relative_to: Path) -> Path:
     expanded = Path(os.path.expandvars(os.path.expanduser(value)))
     return expanded if expanded.is_absolute() else relative_to / expanded
+
+
+def _load_failover_config(raw: object, *, relative_to: Path) -> FailoverConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("failover must be a table")
+
+    enabled = raw.get("enabled", False)
+    allow_unknown_usage = raw.get("allow_unknown_usage", False)
+    allow_interactive_threads = raw.get("allow_interactive_threads", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("failover.enabled must be true or false")
+    if not isinstance(allow_unknown_usage, bool):
+        raise ConfigError("failover.allow_unknown_usage must be true or false")
+    if not isinstance(allow_interactive_threads, bool):
+        raise ConfigError("failover.allow_interactive_threads must be true or false")
+
+    mode = raw.get("mode", "shadow")
+    if mode not in {"shadow", "active"}:
+        raise ConfigError("failover.mode must be 'shadow' or 'active'")
+
+    max_usage_age_seconds = raw.get("max_usage_age_seconds", 300)
+    if (
+        isinstance(max_usage_age_seconds, bool)
+        or not isinstance(max_usage_age_seconds, int)
+        or not 1 <= max_usage_age_seconds <= 86_400
+    ):
+        raise ConfigError("failover.max_usage_age_seconds must be between 1 and 86400")
+
+    providers_raw = raw.get("providers", [])
+    if not isinstance(providers_raw, list):
+        raise ConfigError("failover.providers must be an array of tables")
+    providers: list[FailoverProviderConfig] = []
+    seen: set[str] = set()
+    for index, provider in enumerate(providers_raw, start=1):
+        if not isinstance(provider, dict):
+            raise ConfigError(f"failover provider #{index} must be a table")
+        instance_id = str(provider.get("instance_id", "")).strip()
+        if not instance_id:
+            raise ConfigError(f"failover provider #{index} has an empty instance_id")
+        if instance_id in seen:
+            raise ConfigError(
+                f"failover provider #{index} has duplicate instance_id {instance_id!r}"
+            )
+        seen.add(instance_id)
+        priority = provider.get("priority", 0)
+        provider_enabled = provider.get("enabled", True)
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ConfigError(f"failover provider {instance_id!r} priority must be an integer")
+        if not isinstance(provider_enabled, bool):
+            raise ConfigError(f"failover provider {instance_id!r} enabled must be true or false")
+        providers.append(FailoverProviderConfig(instance_id, priority, provider_enabled))
+
+    project_allowlist_raw = raw.get("project_allowlist", [])
+    if not isinstance(project_allowlist_raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in project_allowlist_raw
+    ):
+        raise ConfigError("failover.project_allowlist must be an array of non-empty paths")
+    project_allowlist = tuple(
+        _path(item, relative_to=relative_to).resolve() for item in project_allowlist_raw
+    )
+
+    return FailoverConfig(
+        enabled=enabled,
+        mode=mode,
+        max_usage_age_seconds=max_usage_age_seconds,
+        allow_unknown_usage=allow_unknown_usage,
+        providers=tuple(providers),
+        allow_interactive_threads=allow_interactive_threads,
+        project_allowlist=project_allowlist,
+    )
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -74,7 +163,7 @@ def load_config(path: str | Path) -> AppConfig:
 
     base_url = str(t3_raw.get("base_url", "http://127.0.0.1:3773")).rstrip("/")
     base_dir = _path(
-        str(t3_raw.get("base_dir", r"%LOCALAPPDATA%\t3-code")), relative_to=root
+        str(t3_raw.get("base_dir", r"%USERPROFILE%\.t3")), relative_to=root
     ).resolve()
     executable_raw = t3_raw.get("executable")
     t3 = T3Config(
@@ -84,6 +173,8 @@ def load_config(path: str | Path) -> AppConfig:
         startup_timeout_seconds=int(t3_raw.get("startup_timeout_seconds", 30)),
         executable=_path(str(executable_raw), relative_to=root).resolve() if executable_raw else None,
     )
+
+    failover = _load_failover_config(raw.get("failover", {}), relative_to=root)
 
     jobs: list[JobConfig] = []
     seen: set[str] = set()
@@ -139,4 +230,4 @@ def load_config(path: str | Path) -> AppConfig:
             if isinstance(exc, ConfigError):
                 raise
             raise ConfigError(f"invalid job #{index}: {exc}") from exc
-    return AppConfig(config_path, state_dir, grace, t3, tuple(jobs))
+    return AppConfig(config_path, state_dir, grace, t3, tuple(jobs), failover)

@@ -442,41 +442,43 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(result.actions[0].outcome, "manual-review")
             self.assertEqual(result.actions[0].reason, "unexpected_thread_change")
 
-    def test_reconcile_rejects_unbound_coordinator_message_before_new_user_message(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            client = FakeClient(failed_thread())
-            coordinator = FailoverCoordinator(self._config(root), client)
-            coordinator.scan()
-            coordinator_message_id = client.dispatched[0]["message"]["messageId"]
-            client.thread = {
-                **failed_thread("backup", "turn-2"),
-                "latestTurn": {"turnId": "turn-2", "state": "running"},
-                "session": {
-                    "status": "running",
-                    "providerName": "codex",
-                    "providerInstanceId": "backup",
-                    "activeTurnId": "turn-2",
-                    "lastError": None,
-                },
-                "messages": [
-                    {
-                        "id": coordinator_message_id,
-                        "role": "user",
-                        "turnId": None,
-                    },
-                    {
-                        "id": "later-user-message",
-                        "role": "user",
-                        "turnId": None,
-                    },
-                ],
-            }
+    def test_reconcile_rejects_coordinator_message_before_new_user_message(self):
+        for coordinator_turn_id in (None, "turn-2"):
+            with self.subTest(coordinator_turn_id=coordinator_turn_id):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    client = FakeClient(failed_thread())
+                    coordinator = FailoverCoordinator(self._config(root), client)
+                    coordinator.scan()
+                    coordinator_message_id = client.dispatched[0]["message"]["messageId"]
+                    client.thread = {
+                        **failed_thread("backup", "turn-2"),
+                        "latestTurn": {"turnId": "turn-2", "state": "running"},
+                        "session": {
+                            "status": "running",
+                            "providerName": "codex",
+                            "providerInstanceId": "backup",
+                            "activeTurnId": "turn-2",
+                            "lastError": None,
+                        },
+                        "messages": [
+                            {
+                                "id": coordinator_message_id,
+                                "role": "user",
+                                "turnId": coordinator_turn_id,
+                            },
+                            {
+                                "id": "later-user-message",
+                                "role": "user",
+                                "turnId": None,
+                            },
+                        ],
+                    }
 
-            result = coordinator.scan()
+                    result = coordinator.scan()
 
-            self.assertEqual(result.actions[0].outcome, "manual-review")
-            self.assertEqual(result.actions[0].reason, "unexpected_thread_change")
+                    self.assertEqual(result.actions[0].outcome, "manual-review")
+                    self.assertEqual(result.actions[0].reason, "unexpected_thread_change")
 
     def test_chained_uncertain_dispatch_retries_identical_second_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

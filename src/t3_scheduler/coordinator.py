@@ -201,10 +201,12 @@ def _has_message(detail: dict[str, Any], message_id: str, turn_id: object) -> bo
     for index, message in enumerate(messages):
         if message_id not in {message.get("id"), message.get("messageId")}:
             continue
+        if any(item.get("role") == "user" for item in messages[index + 1 :]):
+            return False
         if message.get("turnId") == turn_id:
             return True
         if message.get("turnId") is None:
-            return not any(item.get("role") == "user" for item in messages[index + 1 :])
+            return True
     return False
 
 
